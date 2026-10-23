@@ -203,12 +203,13 @@
 
 // Size scalers. MAP_SCALE grows the pitch (length, width, height, corners) and everything placed on it:
 // boost pads, kickoff spots and floor markings. GOAL_SCALE grows the goals (width, height, depth).
-// Cars, the ball and the curve up the walls keep their size. Everyone in a match must use the same values.
-    const MAP_SCALE = 1.2, GOAL_SCALE = 1.6;
+// CAR_SCALE grows the cars (hitbox, wheels, turning circle, model, camera distance); their speeds, jumps and
+// mass stay the same. The ball and the curve up the walls keep their size. Everyone in a match must use the same values.
+    const MAP_SCALE = 1.2, GOAL_SCALE = 1.6, CAR_SCALE = 1;
 // RC = horizontal corner radius, RV = radius of the floor/ceiling-to-wall curve,
 // GE = how far the (invisible) goal box reaches into the arena
     const ARENA = (() => {
-      const M = MAP_SCALE, a = { W: 156 * M, L: 234 * M, H: 56 * M, RC: 30 * M, RV: 12, GE: 52 * M };
+      const M = MAP_SCALE, a = { W: 200 * M, L: 234 * M, H: 56 * M, RC: 30 * M, RV: 12, GE: 52 * M };
       // the goal has to fit on the straight part of the back wall and below the ceiling curve
       const G = Math.min(GOAL_SCALE, (a.W / 2 - a.RC) / 23, (a.H - a.RV - 2) / 22);
       if (G < GOAL_SCALE) console.warn(`GOAL_SCALE ${GOAL_SCALE} doesn't fit this map, using ${G.toFixed(2)}`);
@@ -217,7 +218,7 @@
     })();
     const BALL_R = 5.5;
 // hx/hy/hz = half size of the body hitbox; ride = height of the car's centre above the surface on its wheels
-    const CAR = { hx: 1.5, hy: 0.9, hz: 2.3, ride: 1.35, sphereR: 2.3 };
+    const CAR = { hx: 1.5 * CAR_SCALE, hy: 0.9 * CAR_SCALE, hz: 2.3 * CAR_SCALE, ride: 1.35 * CAR_SCALE, sphereR: 2.3 * CAR_SCALE };
     const MATCH_SECONDS = 300;
 
 // Handling follows Rocket League (values from RocketSim's RLConst.h). RL lengths are converted by matching
@@ -248,7 +249,7 @@
       HIT_LIFT: 0.45, // how much of the upward push a car on its wheels gives the ball (1 = pure contact physics)
       DEMO_SPEED: 66, RESPAWN: 3,
     };
-    const WHEELBASE = 3.5;
+    const WHEELBASE = 3.5 * CAR_SCALE; // distance between front and rear axles
     const curve = (pts, x) => {
       if (x <= pts[0][0]) return pts[0][1];
       for (let i = 1; i < pts.length; i++) if (x <= pts[i][0]) { const [x0, y0] = pts[i - 1], [x1, y1] = pts[i]; return y0 + (y1 - y0) * (x - x0) / (x1 - x0); }
@@ -371,14 +372,14 @@
       return {
         id, team, x: 0, y: CAR.ride, z: 0, vx: 0, vy: 0, vz: 0, qx: 0, qy: 0, qz: 0, qw: 1, wx: 0, wy: 0, wz: 0,
         ground: true, boost: 33, canDodge: false, jumpT: 0, flipT: 0, fdx: 0, fdz: 0,
-        jc: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0, pitchLock: false,
+        jc: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0,
       };
     }
     function placeCar(c, spot) {
       Object.assign(c, {
         x: spot.x, y: CAR.ride, z: spot.z, vx: 0, vy: 0, vz: 0,
         qx: 0, qy: Math.sin(spot.yaw / 2), qz: 0, qw: Math.cos(spot.yaw / 2), wx: 0, wy: 0, wz: 0,
-        ground: true, boost: 33, canDodge: false, jumpT: 0, flipT: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0, pitchLock: false,
+        ground: true, boost: 33, canDodge: false, jumpT: 0, flipT: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0,
       });
     }
     function newBall() { return { x: 0, y: BALL_R, z: 0, vx: 0, vy: 0, vz: 0 }; }
@@ -472,10 +473,9 @@
         c.vy = A.f[1] * vf + A.r[1] * vr + n[1] * vn;
         c.vz = A.f[2] * vf + A.r[2] * vr + n[2] * vn;
         c.wx = c.wz = 0; // keep wy: a turning car keeps turning when it jumps or drives off an edge
-        c.pitchLock = Math.abs(th) > 0.05; // throttle still held on takeoff won't pitch the car
       } else {
         c.jumpT += dt;
-        if (Math.abs(th) <= 0.05) c.pitchLock = false;
+        let yawSpin = 0, yawAxis = null; // the air-control turn around the world vertical, kept world-fixed below
         if (c.flipT > 0) {
           // one full turn over FLIP_T, easing in and out (spin rate follows 6u(1-u), which integrates to 1)
           const u = 1 - (c.flipT - dt / 2) / K.FLIP_T, rate = (2 * Math.PI / K.FLIP_T) * 6 * u * (1 - u);
@@ -491,7 +491,7 @@
           c.wx = (c.wx - nl[0] * wn) * kr; c.wy = (c.wy - nl[1] * wn) * kr; c.wz = (c.wz - nl[2] * wn) * kr;
         } else {
           const rollIn = clamp(roll + (ar ? st : 0), -1, 1), yawIn = ar ? 0 : st;
-          const pitchIn = c.pitchLock ? 0 : th, T = K.AIR_TORQUE, D = K.AIR_DAMPING;
+          const pitchIn = th, T = K.AIR_TORQUE, D = K.AIR_DAMPING;
           // yaw turns around the world vertical (in car-local axes), so steering never spins the car diagonally;
           // split that part off so pitch/roll handling below doesn't fight it
           const A = carAxes(c), yl = [-A.r[1], A.u[1], A.f[1]];
@@ -504,6 +504,7 @@
           c.wy -= D[1] * c.wy * dt;
           c.wz += (rollIn * T[2] - D[2] * c.wz) * dt;
           c.wx += yl[0] * wy; c.wy += yl[1] * wy; c.wz += yl[2] * wy;
+          yawSpin = wy; yawAxis = yl;
           const wl = Math.hypot(c.wx, c.wy, c.wz);
           if (wl > K.MAX_ANG) { const s = K.MAX_ANG / wl; c.wx *= s; c.wy *= s; c.wz *= s; }
         }
@@ -514,6 +515,12 @@
         }
         const wl = Math.hypot(c.wx, c.wy, c.wz);
         if (wl > 1e-5) rotLocal(c, c.wx / wl, c.wy / wl, c.wz / wl, wl * dt);
+        if (yawAxis) {
+          // spin is stored in car axes, so as the car pitches its turn around the vertical would tip over into
+          // a roll; re-aim that part at the world vertical as seen from the car's new orientation
+          const B = carAxes(c), yn = [-B.r[1], B.u[1], B.f[1]];
+          c.wx += yawSpin * (yn[0] - yawAxis[0]); c.wy += yawSpin * (yn[1] - yawAxis[1]); c.wz += yawSpin * (yn[2] - yawAxis[2]);
+        }
         if (c.boosting) {
           const { f } = carAxes(c);
           c.vx += f[0] * K.BOOST_ACC * dt; c.vy += f[1] * K.BOOST_ACC * dt; c.vz += f[2] * K.BOOST_ACC * dt;
@@ -531,7 +538,7 @@
     for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) CORNERS.push([sx * CAR.hx, sy * CAR.hy, sz * CAR.hz, sy < 0]);
 // wheels (contact points below the body) count as contact points too while not driving
     const WHEELS = [];
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) WHEELS.push([sx * (CAR.hx - 0.25), -CAR.ride, sz * (CAR.hz - 0.55), true]);
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) WHEELS.push([sx * (CAR.hx - 0.25 * CAR_SCALE), -CAR.ride, sz * (CAR.hz - 0.55 * CAR_SCALE), true]);
 // inertia of the body (box), twice a plain box so it feels heavy and impacts don't set it spinning wildly
     const INERTIA = [((2 * CAR.hy) ** 2 + (2 * CAR.hz) ** 2) / 6, ((2 * CAR.hx) ** 2 + (2 * CAR.hz) ** 2) / 6, ((2 * CAR.hx) ** 2 + (2 * CAR.hy) ** 2) / 6];
 
@@ -742,11 +749,11 @@
       return null;
     }
 
-    return { TICK_RATE, DT, SNAP_EVERY, MAP_SCALE, ARENA, BALL_R, CAR, MATCH_SECONDS, K, PADS, clamp, rampR, RAMP_TAPER, arenaDist, arenaNormal, carAxes, kickoffSpot, newCar, placeCar, newBall, stepCar, stepBall, goalCheck, collideCarBall, collideCars };
+    return { TICK_RATE, DT, SNAP_EVERY, MAP_SCALE, CAR_SCALE, ARENA, BALL_R, CAR, MATCH_SECONDS, K, PADS, clamp, rampR, RAMP_TAPER, arenaDist, arenaNormal, carAxes, kickoffSpot, newCar, placeCar, newBall, stepCar, stepBall, goalCheck, collideCarBall, collideCars };
   })();
   // ================= scene =================
   const { World, TEAM_COLORS } = (() => {
-    const { MAP_SCALE, ARENA, BALL_R, PADS, K, CAR, rampR, RAMP_TAPER } = P;
+    const { MAP_SCALE, CAR_SCALE, ARENA, BALL_R, PADS, K, CAR, rampR, RAMP_TAPER } = P;
 
     const TEAM_COLORS = [0x2f8cff, 0xff8a1f];
     const A = ARENA, hw = A.W / 2, hl = A.L / 2, RV = A.RV;
@@ -855,10 +862,11 @@
           for (const t of [...ts].sort((p, q) => p - q)) contour.push([x0 + (x1 - x0) * t, z0 + (z1 - z0) * t, nx, nz]);
         };
         const arc = (cx, cz, a0) => { for (let i = 0; i < 12; i++) { const a = a0 + (i / 12) * Math.PI / 2; contour.push([cx + irc * Math.cos(a), cz + irc * Math.sin(a), Math.cos(a), Math.sin(a)]); } };
-        // extra samples at the goal posts and across the ramp taper beside them
+        // extra samples at the goal posts, the frame and across the ramp taper beside them
         const gxT = (x0, x1) => {
           const ts = [];
           for (let i = 0; i <= 12; i++) for (const sx of [-1, 1]) ts.push((sx * (A.GW / 2 + RAMP_TAPER * i / 12) - x0) / (x1 - x0));
+          for (const sx of [-1, 1]) ts.push((sx * (A.GW / 2 + A.GF) - x0) / (x1 - x0)); // outer edge of the rounded frame
           return ts;
         };
         seg(ia, -ib + irc, ia, ib - irc, 1, 0); arc(ia - irc, ib - irc, 0);
@@ -867,7 +875,7 @@
         seg(-ia + irc, -ib, ia - irc, -ib, 0, -1, gxT(-ia + irc, ia - irc)); arc(ia - irc, -ib + irc, Math.PI * 1.5);
         const prof = []; // [h, y, isRamp]
         for (let i = 0; i <= 8; i++) { const t = (i / 8) * Math.PI / 2; prof.push([RV * Math.sin(t), RV * (1 - Math.cos(t))]); }
-        for (const y of [A.GH, A.H / 2].sort((a, b) => a - b)) prof.push([RV, y]); // wall rows, bottom to top
+        for (const y of [A.GH + A.GF, A.H / 2].sort((a, b) => a - b)) prof.push([RV, y]); // wall rows, bottom to top
         for (let i = 8; i >= 0; i--) { const t = (i / 8) * Math.PI / 2; prof.push([RV * Math.sin(t), A.H - RV * (1 - Math.cos(t))]); }
         const vert = (ci, pj) => {
           const c = contour[ci % contour.length];
@@ -892,7 +900,8 @@
           for (let i = 0; i < NC; i++) for (let j = j0; j < j1; j++) {
             const a = vert(i, j), c = vert(i + 1, j + 1);
             const mx = (a[0] + c[0]) / 2, my = (a[1] + c[1]) / 2, mz = (a[2] + c[2]) / 2;
-            if (Math.abs(mx) < A.GW / 2 && my < A.GH && Math.abs(mz) > ib - 0.01) continue; // goal mouth + flattened floor
+            const gx = j < 8 ? A.GW / 2 : A.GW / 2 + A.GF; // the wall (not the ramp in front of it) also opens for the rounded frame
+            if (Math.abs(mx) < gx && my < A.GH + A.GF && Math.abs(mz) > ib - 0.01) continue; // goal mouth
             idx.push(id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j), id(i + 1, j + 1), id(i, j + 1));
           }
           const g = new THREE.BufferGeometry();
@@ -978,35 +987,51 @@
       }
 
       buildGoal(sz, team) {
-        const s = this.scene, col = TEAM_COLORS[team];
+        const s = this.scene, col = TEAM_COLORS[team], z = sz * hl, r = A.GF, R = A.GR;
         const frame = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: col, emissiveIntensity: 0.8 });
-        const z = sz * hl;
+        // frame: the rounded edge (radius GF) where the goal meets the back wall, following the mouth's outline
+        const fz = z + sz * r;
         for (const sx of [-1, 1]) {
-          const post = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, A.GH, 12), frame);
-          post.position.set(sx * A.GW / 2, A.GH / 2, z); s.add(post);
+          const post = new THREE.Mesh(new THREE.CylinderGeometry(r, r, A.GH - R, 24), frame);
+          post.position.set(sx * (A.GW / 2 + r), (A.GH - R) / 2, fz); s.add(post);
+          const corner = new THREE.Mesh(new THREE.TorusGeometry(R + r, r, 16, 16, Math.PI / 2), frame);
+          corner.position.set(sx * (A.GW / 2 - R), A.GH - R, fz); if (sx < 0) corner.rotation.z = Math.PI / 2; s.add(corner);
         }
-        const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, A.GW, 12), frame);
-        bar.rotation.z = Math.PI / 2; bar.position.set(0, A.GH, z); s.add(bar);
+        const bar = new THREE.Mesh(new THREE.CylinderGeometry(r, r, A.GW - 2 * R, 24), frame);
+        bar.rotation.z = Math.PI / 2; bar.position.set(0, A.GH + r, fz); s.add(bar);
+
+        // inside: a box open at the mouth with its inside edges rounded like the physics (radius GR).
+        // Built in goal-local coordinates (+z = into the goal), then turned to face the pitch.
+        const hx = A.GW / 2, hy = A.GH / 2, hz = A.GD / 2;
+        const roundPt = (x, y, zz) => { // the mouth end (zz = -hz) stays square
+          const cx = P.clamp(x, -hx + R, hx - R), cy = P.clamp(y, -hy + R, hy - R), cz = Math.min(zz, hz - R);
+          const dx = x - cx, dy = y - cy, dz = zz - cz, l = Math.hypot(dx, dy, dz);
+          return l > 1e-6 ? [cx + dx / l * R, cy + dy / l * R, cz + dz / l * R] : [x, y, zz];
+        };
+        const geo = new THREE.BoxGeometry(2 * hx, 2 * hy, 2 * hz, 32, 24, 16), pos = geo.attributes.position;
+        const bunch = (v, h) => h * Math.sin((v / h) * Math.PI / 2); // more vertices near the (rounded) edges
+        for (let i = 0; i < pos.count; i++) pos.setXYZ(i, ...roundPt(bunch(pos.getX(i), hx), bunch(pos.getY(i), hy), bunch(pos.getZ(i), hz)));
+        geo.computeVertexNormals();
         const netMat = new THREE.MeshStandardMaterial({ color: col, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false, emissive: col, emissiveIntensity: 0.4 });
-        const back = new THREE.Mesh(new THREE.PlaneGeometry(A.GW, A.GH), netMat); back.position.set(0, A.GH / 2, z + sz * A.GD); s.add(back);
-        const top = new THREE.Mesh(new THREE.PlaneGeometry(A.GW, A.GD), netMat); top.rotation.x = Math.PI / 2; top.position.set(0, A.GH, z + sz * A.GD / 2); s.add(top);
-        for (const sx of [-1, 1]) {
-          const side = new THREE.Mesh(new THREE.PlaneGeometry(A.GD, A.GH), netMat); side.rotation.y = Math.PI / 2; side.position.set(sx * A.GW / 2, A.GH / 2, z + sz * A.GD / 2); s.add(side);
-        }
-        const gf = new THREE.Mesh(new THREE.PlaneGeometry(A.GW, A.GD), new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.25, roughness: 1 }));
-        gf.rotation.x = -Math.PI / 2; gf.position.set(0, 0.02, z + sz * A.GD / 2); gf.receiveShadow = true; s.add(gf);
-        // net grid
-        const g = [];
-        for (let i = 0; i <= 12; i++) { const x = -A.GW / 2 + (i * A.GW) / 12; g.push(x, 0, z + sz * A.GD, x, A.GH, z + sz * A.GD, x, A.GH, z, x, A.GH, z + sz * A.GD); }
-        for (let j = 0; j <= 5; j++) { const y = (j * A.GH) / 5; g.push(-A.GW / 2, y, z + sz * A.GD, A.GW / 2, y, z + sz * A.GD); for (const sx of [-1, 1]) g.push(sx * A.GW / 2, y, z, sx * A.GW / 2, y, z + sz * A.GD); }
+        const floorMat = new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.25, roughness: 1, side: THREE.DoubleSide });
+        const hidden = new THREE.MeshBasicMaterial({ visible: false });
+        const inside = new THREE.Mesh(geo, [netMat, netMat, netMat, floorMat, netMat, hidden]); // +x -x top floor back mouth
+        inside.receiveShadow = true;
+        // net grid, bent around the same rounded edges
+        const g = [], line = (pts) => { for (let i = 0; i < pts.length - 1; i++) g.push(...roundPt(...pts[i]), ...roundPt(...pts[i + 1])); };
+        const path = (...legs) => { const pts = []; for (const [a, b] of legs) for (let k = 0; k <= 30; k++) pts.push(a.map((v, n) => v + (b[n] - v) * k / 30)); return pts; };
+        for (let i = 0; i <= 12; i++) { const x = -hx + (2 * hx * i) / 12; line(path([[x, -hy, hz], [x, hy, hz]], [[x, hy, hz], [x, hy, -hz]])); }
+        for (let j = 0; j <= 5; j++) { const y = -hy + (2 * hy * j) / 5; line(path([[-hx, y, -hz], [-hx, y, hz]], [[-hx, y, hz], [hx, y, hz]], [[hx, y, hz], [hx, y, -hz]])); }
         const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(g, 3));
-        s.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.5 })));
+        const grp = new THREE.Group(); grp.position.set(0, hy, z + sz * hz); if (sz < 0) grp.rotation.y = Math.PI;
+        grp.add(inside, new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.5 })));
+        s.add(grp);
       }
 
       makeCar(id, team, name, isMe) {
         const col = TEAM_COLORS[team];
         const outer = new THREE.Group(); outer.rotation.order = 'YXZ';
-        const inner = new THREE.Group(); outer.add(inner);
+        const inner = new THREE.Group(); outer.add(inner); inner.scale.setScalar(CAR_SCALE); // model below is built at base size
         const paint = new THREE.MeshStandardMaterial({ color: col, roughness: 0.35, metalness: 0.4 });
         const dark = new THREE.MeshStandardMaterial({ color: 0x111418, roughness: 0.3, metalness: 0.6 });
         const add = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = true; inner.add(m); return m; };
@@ -1043,7 +1068,7 @@
         const tire = new THREE.MeshStandardMaterial({ color: 0x0d0d0d, roughness: 0.9 });
         const rimMat = new THREE.MeshStandardMaterial({ color: 0xb8c0cc, roughness: 0.3, metalness: 0.8 });
         const rimG = new THREE.CylinderGeometry(0.32, 0.32, 0.52, 12); rimG.rotateZ(Math.PI / 2);
-        for (const sx of [-1.38, 1.38]) for (const sz of [-1.75, 1.75]) { add(wheelG, tire, sx, -CAR.ride + 0.62, sz); add(rimG, rimMat, sx, -CAR.ride + 0.62, sz); }
+        for (const sx of [-1.38, 1.38]) for (const sz of [-1.75, 1.75]) { add(wheelG, tire, sx, -CAR.ride / CAR_SCALE + 0.62, sz); add(rimG, rimMat, sx, -CAR.ride / CAR_SCALE + 0.62, sz); }
         const lightMat = new THREE.MeshBasicMaterial({ color: 0xfff6d0 });
         for (const sx of [-0.9, 0.9]) add(new THREE.BoxGeometry(0.5, 0.14, 0.1), lightMat, sx, -0.22, 2.52);
         const flameMat = new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
@@ -1082,7 +1107,7 @@
         const f = s.boosting ? 0.8 + Math.random() * 0.4 : 0;
         c.flame.visible = c.flame2.visible = !!s.boosting;
         c.flame.scale.set(1, f, 1); c.flame2.scale.set(1, f, 1);
-        if (c.label) c.label.position.set(s.x, s.y + 3.8, s.z);
+        if (c.label) c.label.position.set(s.x, s.y + 3.8 * CAR_SCALE, s.z);
       }
       setBall(x, y, z, visible, dt, vx, vz) {
         this.ball.visible = visible; this.ballRing.visible = visible;
@@ -1284,7 +1309,7 @@
           // boost pads
           for (let i = 0; i < P.PADS.length; i++) {
             if (this.pads[i] > 0) { this.pads[i] -= dt; continue; }
-            const pad = P.PADS[i], rr = pad.big ? 4.5 : 3;
+            const pad = P.PADS[i], rr = (pad.big ? 4.5 : 3) * P.CAR_SCALE;
             for (const p of cars) {
               const c = p.car;
               if (c.dead > 0 || c.boost >= 100 || c.y > 5) continue;
@@ -1340,7 +1365,7 @@
           const c = p.car; if (!c || p.team < 0) continue;
           cars.push([p.id, r2(c.x), r2(c.y), r2(c.z), r4(c.qx), r4(c.qy), r4(c.qz), r4(c.qw), r2(c.vx), r2(c.vy), r2(c.vz),
             r2(c.wx), r2(c.wy), r2(c.wz), Math.round(c.boost),
-            (c.ground ? 1 : 0) | (c.boosting ? 2 : 0) | (c.canDodge ? 4 : 0) | (c.dead > 0 ? 8 : 0) | (c.pitchLock ? 16 : 0),
+            (c.ground ? 1 : 0) | (c.boosting ? 2 : 0) | (c.canDodge ? 4 : 0) | (c.dead > 0 ? 8 : 0),
             r3(c.flipT), r3(c.fdx), r3(c.fdz), c.jc, r3(c.jumpT), r3(c.stuckT), r3(c.jhT)]);
         }
         const base = {
@@ -1405,12 +1430,12 @@
       const bd = Math.hypot(b.x - c.x, b.z - c.z);
       // distances measured from the ball's surface, so they hold for any ball size
       const R = P.BALL_R;
-      if (c.ground && ai.t <= 0 && bd < R + 6.8 && b.y > R + 1.3 && b.y < R + 9.8 && Math.abs(ang) < 0.5) {
+      if (c.ground && ai.t <= 0 && bd < R + P.CAR.hz + 4.5 && b.y > R + 1.3 && b.y < R + 9.8 && Math.abs(ang) < 0.5) {
         ai.t = 0.8; if (Math.random() < L.jumpChance) { inp.jc++; ai.dodge = L.dodge ? 0.18 : 0; }
-      } else if (L.dodge && c.ground && ai.t <= 0 && bd < R + 4.3 && b.y < R + 1.8 &&Math.abs(ang) < 0.3 && Math.hypot(c.vx, c.vz) > 25) {
+      } else if (L.dodge && c.ground && ai.t <= 0 && bd < R + P.CAR.hz + 2 && b.y < R + 1.8 &&Math.abs(ang) < 0.3 && Math.hypot(c.vx, c.vz) > 25) {
         ai.t = 1.0; if (Math.random() < L.jumpChance) { inp.jc++; ai.dodge = 0.08; }
       }
-      if (!c.ground) { inp.th = c.pitchLock ? 0 : P.clamp(A.f[1] * 2.5, -1, 1); inp.roll = P.clamp(A.r[1] * 2.5, -1, 1); inp.st = 0; } // level out in the air
+      if (!c.ground) { inp.th = P.clamp(A.f[1] * 2.5, -1, 1); inp.roll = P.clamp(A.r[1] * 2.5, -1, 1); inp.st = 0; } // level out in the air
       if (ai.dodge > 0) { ai.dodge -= P.DT; if (ai.dodge <= 0 && !c.ground && c.canDodge) { inp.th = 1; inp.st = 0; inp.jc++; } }
       if (!c.ground && c.stuckT > 0.4 && ai.t <= 0) { inp.jc++; ai.t = 0.8; } // turtled: flip back over
       inp.jc &= 255;
@@ -1669,7 +1694,7 @@
     const ql = Math.hypot(a[4], a[5], a[6], a[7]) || 1;
     return { id: a[0], x: a[1], y: a[2], z: a[3], qx: a[4] / ql, qy: a[5] / ql, qz: a[6] / ql, qw: a[7] / ql,
       vx: a[8], vy: a[9], vz: a[10], wx: a[11], wy: a[12], wz: a[13], boost: a[14],
-      ground: !!(a[15] & 1), boosting: !!(a[15] & 2), canDodge: !!(a[15] & 4), dead: a[15] & 8 ? 1 : 0, pitchLock: !!(a[15] & 16),
+      ground: !!(a[15] & 1), boosting: !!(a[15] & 2), canDodge: !!(a[15] & 4), dead: a[15] & 8 ? 1 : 0,
       flipT: a[16], fdx: a[17], fdz: a[18], jc: a[19], jumpT: a[20], stuckT: a[21], jhT: a[22] };
   }
   const predicting = () => lastSnap && (lastSnap.st === 'playing' || lastSnap.st === 'goal');
@@ -2063,13 +2088,14 @@
       for (let i = 0; i < 3; i++) camBack[i] += (back[i] - camBack[i]) * kb;
       const cb = norm3(camBack);
       // height above the car: full on the floor, less on walls, below the car on the ceiling
-      const h = O.camHeight * (0.35 + 0.65 * n[1]);
-      p = [me.x + cb[0] * O.camDist, me.y + cb[1] * O.camDist + h, me.z + cb[2] * O.camDist];
+      // camera distance and height grow with the car so it keeps the same framing
+      const cs = P.CAR_SCALE, dist = O.camDist * cs, h = O.camHeight * cs * (0.35 + 0.65 * n[1]);
+      p = [me.x + cb[0] * dist, me.y + cb[1] * dist + h, me.z + cb[2] * dist];
       if (useBall) {
         const w = 0.55 + 0.3 * Math.max(0, n[1]); // on walls/ceiling look more at the car so it stays in frame
-        look = [me.x + (ball.x - me.x) * w, me.y + (ball.y - me.y) * w * 0.7 + 0.6, me.z + (ball.z - me.z) * w];
+        look = [me.x + (ball.x - me.x) * w, me.y + (ball.y - me.y) * w * 0.7 + 0.6 * cs, me.z + (ball.z - me.z) * w];
       }
-      else look = [me.x - cb[0] * 6, me.y + 1.5 * Math.max(0.2, n[1]), me.z - cb[2] * 6];
+      else look = [me.x - cb[0] * 6 * cs, me.y + 1.5 * cs * Math.max(0.2, n[1]), me.z - cb[2] * 6 * cs];
     } else {
       const t = performance.now() / 6000;
       p = [ball.x + Math.sin(t) * 40, 22, ball.z + Math.cos(t) * 40]; look = [ball.x, ball.y, ball.z];
