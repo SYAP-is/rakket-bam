@@ -204,7 +204,7 @@
 // Size scalers. MAP_SCALE grows the pitch (length, width, height, corners) and everything placed on it:
 // boost pads, kickoff spots and floor markings. GOAL_SCALE grows the goals (width, height, depth).
 // Cars, the ball and the curve up the walls keep their size. Everyone in a match must use the same values.
-    const MAP_SCALE = 1.4, GOAL_SCALE = 1.6;
+    const MAP_SCALE = 1.2, GOAL_SCALE = 1.6;
 // RC = horizontal corner radius, RV = radius of the floor/ceiling-to-wall curve,
 // GE = how far the (invisible) goal box reaches into the arena
     const ARENA = (() => {
@@ -212,7 +212,8 @@
       // the goal has to fit on the straight part of the back wall and below the ceiling curve
       const G = Math.min(GOAL_SCALE, (a.W / 2 - a.RC) / 23, (a.H - a.RV - 2) / 22);
       if (G < GOAL_SCALE) console.warn(`GOAL_SCALE ${GOAL_SCALE} doesn't fit this map, using ${G.toFixed(2)}`);
-      return { ...a, GW: 46 * G, GH: 22 * G, GD: 15 * G };
+      // GR = rounding of the goal's inside edges, GF = rounding of the frame (posts and crossbar) at the mouth
+      return { ...a, GW: 46 * G, GH: 22 * G, GD: 15 * G, GR: 3 * G, GF: 1.5 * G };
     })();
     const BALL_R = 5.5;
 // hx/hy/hz = half size of the body hitbox; ride = height of the car's centre above the surface on its wheels
@@ -244,6 +245,7 @@
       BODY_MU: 0.35, BODY_E: 0.15,
       BALL_E: 0.62, BALL_MAX: 140,
       CAR_MASS: 10, BALL_MASS: 1, HIT_E: 0.55, HIT_EXTRA: 0.3,
+      HIT_LIFT: 0.45, // how much of the upward push a car on its wheels gives the ball (1 = pure contact physics)
       DEMO_SPEED: 66, RESPAWN: 3,
     };
     const WHEELBASE = 3.5;
@@ -275,7 +277,8 @@
 // ---------- arena SDF ----------
 // Radius of the floor-to-wall curve: full along the walls, tapering smoothly to nothing at the goal posts,
 // so the ramp beside each goal slopes down into the flat floor in front of it instead of ending in a cliff.
-    const RAMP_TAPER = 24;
+// Kept short so the wall right beside the goal can still be driven up.
+    const RAMP_TAPER = 8;
     function rampR(x) { const t = clamp((Math.abs(x) - ARENA.GW / 2) / RAMP_TAPER, 0, 1); return ARENA.RV * t * t * (3 - 2 * t); }
     function sdArena(x, y, z) {
       const RC = ARENA.RC, RV = y < hh ? rampR(x) : ARENA.RV;
@@ -284,14 +287,26 @@
       const a = d2 + RV, b = Math.abs(y - hh) - (hh - RV);
       return Math.hypot(Math.max(a, 0), Math.max(b, 0)) + Math.min(Math.max(a, b), 0) - RV;
     }
+// goal box (reaching GE into the arena) with its inside edges rounded by GR
     function sdGoals(x, y, z) {
-      const { GW, GH, GD, GE } = ARENA;
+      const { GW, GH, GD, GE, GR } = ARENA;
       const cz = hl + GD / 2 - GE / 2, hz = GD / 2 + GE / 2;
-      const qx = Math.abs(x) - GW / 2, qy = Math.abs(y - GH / 2) - GH / 2, qz = Math.abs(Math.abs(z) - cz) - hz;
-      return Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0);
+      const qx = Math.abs(x) - GW / 2 + GR, qy = Math.abs(y - GH / 2) - GH / 2 + GR, qz = Math.abs(Math.abs(z) - cz) - hz + GR;
+      return Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0) - GR;
+    }
+// The goal frame (posts and crossbar) is rounded with radius GF where the goal meets the back wall: this shape
+// is the bit of wall carved away behind the frame edge, a GF x GF strip minus a quarter circle, following the
+// goal mouth's outline (s = distance outside the mouth, v = distance behind the goal line), above the floor.
+    function sdFrameCut(x, y, z) {
+      const { GW, GH, GR, GF: r } = ARENA;
+      const qx = Math.abs(x) - GW / 2 + GR, qy = y - GH + GR;
+      const s = Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - GR, v = Math.abs(z) - hl;
+      const bs = Math.abs(s - r / 2) - r / 2, bv = Math.abs(v - r / 2) - r / 2;
+      const strip = Math.hypot(Math.max(bs, 0), Math.max(bv, 0)) + Math.min(Math.max(bs, bv), 0);
+      return Math.max(strip, r - Math.hypot(s - r, v - r), -y);
     }
 // Distance from a point to the nearest arena surface (positive = inside the playable space).
-    function arenaDist(x, y, z) { return -Math.min(sdArena(x, y, z), sdGoals(x, y, z)); }
+    function arenaDist(x, y, z) { return -Math.min(sdArena(x, y, z), sdGoals(x, y, z), sdFrameCut(x, y, z)); }
 // Unit normal of the nearest surface, pointing into the playable space.
     function arenaNormal(x, y, z) {
       const e = 0.02;
@@ -675,6 +690,16 @@
       const vn = rvx * nx + rvy * ny + rvz * nz;
       if (vn >= 0) return true;
       const j = -(1 + K.HIT_E) * vn / (1 / K.BALL_MASS + 1 / K.CAR_MASS);
+      if (c.ground) {
+        // the ball sits higher than the car's roof, so a driving car meets it on its top edge and would
+        // scoop it steeply upwards; flatten the push's upward part (jumping into the ball keeps full lift)
+        const nu = nx * u[0] + ny * u[1] + nz * u[2];
+        if (nu > 0) {
+          const s = nu * (1 - K.HIT_LIFT);
+          nx -= u[0] * s; ny -= u[1] * s; nz -= u[2] * s;
+          const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+        }
+      }
       b.vx += nx * j / K.BALL_MASS; b.vy += ny * j / K.BALL_MASS; b.vz += nz * j / K.BALL_MASS;
       let cx = -nx * j / K.CAR_MASS, cy = -ny * j / K.CAR_MASS, cz = -nz * j / K.CAR_MASS;
       if (c.ground) { const cu = cx * u[0] + cy * u[1] + cz * u[2]; if (cu > 0) { cx -= u[0] * cu; cy -= u[1] * cu; cz -= u[2] * cu; } } // don't lift a driving car
