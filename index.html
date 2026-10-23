@@ -201,29 +201,59 @@
     const DT = 1 / TICK_RATE;
     const SNAP_EVERY = 2; // server sends a snapshot every N ticks (30 Hz)
 
+// Size scalers. MAP_SCALE grows the pitch (length, width, height, corners) and everything placed on it:
+// boost pads, kickoff spots and floor markings. GOAL_SCALE grows the goals (width, height, depth).
+// Cars, the ball and the curve up the walls keep their size. Everyone in a match must use the same values.
+    const MAP_SCALE = 1.4, GOAL_SCALE = 1.6;
 // RC = horizontal corner radius, RV = radius of the floor/ceiling-to-wall curve,
-// GE = how far the (invisible) goal box reaches into the arena; it flattens the floor curve in front of the goal
-    const ARENA = { W: 156, L: 234, H: 56, GW: 46, GH: 22, GD: 15, RC: 30, RV: 12, GE: 52 };
-    const BALL_R = 4.2;
+// GE = how far the (invisible) goal box reaches into the arena
+    const ARENA = (() => {
+      const M = MAP_SCALE, a = { W: 156 * M, L: 234 * M, H: 56 * M, RC: 30 * M, RV: 12, GE: 52 * M };
+      // the goal has to fit on the straight part of the back wall and below the ceiling curve
+      const G = Math.min(GOAL_SCALE, (a.W / 2 - a.RC) / 23, (a.H - a.RV - 2) / 22);
+      if (G < GOAL_SCALE) console.warn(`GOAL_SCALE ${GOAL_SCALE} doesn't fit this map, using ${G.toFixed(2)}`);
+      return { ...a, GW: 46 * G, GH: 22 * G, GD: 15 * G };
+    })();
+    const BALL_R = 5.5;
 // hx/hy/hz = half size of the body hitbox; ride = height of the car's centre above the surface on its wheels
     const CAR = { hx: 1.5, hy: 0.9, hz: 2.3, ride: 1.35, sphereR: 2.3 };
     const MATCH_SECONDS = 300;
 
+// Handling follows Rocket League (values from RocketSim's RLConst.h). RL lengths are converted by matching
+// wheelbases (RL Octane 84.87 uu, ours 3.5 units); speeds, jumps and gravity stay tuned to this smaller arena.
+    const RL_UU = 84.87 / 3.5; // RL units per game unit
+    const RL_TORQUE = (2 * Math.PI / 65536) * 1000; // RL's CAR_TORQUE_SCALE: torque values -> rad/s²
     const K = {
       G: 24,
-      ACC: 44, BRAKE: 95, COAST: 9,
+      ACC: 1600 / RL_UU, BRAKE: 95, COAST: 9, // ACC: RL throttle acceleration from standstill, tapering towards top speed
       MAX_DRIVE: 48, MAX_REV: 24, MAX_SPEED: 82,
       BOOST_ACC: 42, BOOST_USE: 33,
       GRIP: 12, HB_GRIP: 1.4,
       STICK_SPEED: 12,
-      JUMP_V: 10, JUMP_HOLD: 38, JUMP_HOLD_T: 0.2, DJ_V: 10, DODGE_V: 20, DODGE_WIN: 1.3, FLIP_T: 0.6,
-      AIR_PITCH: 5.2, AIR_YAW: 4.0, AIR_ROLL: 5.5, AIR_RESP: 6, AIR_DAMP: 3,
+      // RL front-wheel steering angle (rad) by speed (uu/s), normal and powersliding
+      STEER_CURVE: [[0, 0.53356], [500, 0.31930], [1000, 0.18203], [1500, 0.10570], [1750, 0.08507], [3000, 0.03454]],
+      SLIDE_STEER_CURVE: [[0, 0.39235], [2500, 0.12610]],
+      STEER_RESP: 14, // how fast the turn rate follows the stick (1/s), so steering eases in instead of snapping
+      JUMP_V: 10, JUMP_HOLD: 38, JUMP_HOLD_T: 0.2, DJ_V: 10, DODGE_V: 20, DODGE_WIN: 1.3,
+      FLIP_T: 0.65, // RL FLIP_TORQUE_TIME
+      DODGE_SIDE_SCALE: 1.9, DODGE_BACK_SCALE: 2.5, // RL: sideways / braking dodges get stronger with speed
+      // RL air control: torque (pitch, yaw, roll) and damping; pitch/yaw damping fades out while that input is held
+      AIR_TORQUE: [130 * RL_TORQUE, 95 * RL_TORQUE, 400 * RL_TORQUE], AIR_DAMPING: [30 * RL_TORQUE, 20 * RL_TORQUE, 50 * RL_TORQUE],
+      MAX_ANG: 5.5, // RL CAR_MAX_ANG_SPEED (rad/s)
+      REST_SPIN: 8, REST_DAMP: 1.5,
       BODY_MU: 0.35, BODY_E: 0.15,
       BALL_E: 0.62, BALL_MAX: 140,
       CAR_MASS: 10, BALL_MASS: 1, HIT_E: 0.55, HIT_EXTRA: 0.3,
       DEMO_SPEED: 66, RESPAWN: 3,
     };
-    K.FLIP_RATE = (Math.PI * 2) / K.FLIP_T;
+    const WHEELBASE = 3.5;
+    const curve = (pts, x) => {
+      if (x <= pts[0][0]) return pts[0][1];
+      for (let i = 1; i < pts.length; i++) if (x <= pts[i][0]) { const [x0, y0] = pts[i - 1], [x1, y1] = pts[i]; return y0 + (y1 - y0) * (x - x0) / (x1 - x0); }
+      return pts[pts.length - 1][1];
+    };
+// turn rate (rad/s) of a car at speed sp (game units/s) with full steering, like RL's front-wheel steering
+    const turnRate = (sp, slide) => sp * Math.tan(curve(slide ? K.SLIDE_STEER_CURVE : K.STEER_CURVE, sp * RL_UU)) / WHEELBASE;
 
     const hw = ARENA.W / 2, hl = ARENA.L / 2, hh = ARENA.H / 2;
 
@@ -236,14 +266,19 @@
       for (const x of [-39, 0, 39]) for (const z of [-78, -39, 39, 78]) p.push({ x, z, big: false });
       for (const x of [-23, 23]) p.push({ x, z: 0, big: false });
       for (const z of [-99, 99]) p.push({ x: 0, z, big: false });
+      for (const q of p) { q.x *= MAP_SCALE; q.z *= MAP_SCALE; }
       return p;
     })();
 
     const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
 // ---------- arena SDF ----------
+// Radius of the floor-to-wall curve: full along the walls, tapering smoothly to nothing at the goal posts,
+// so the ramp beside each goal slopes down into the flat floor in front of it instead of ending in a cliff.
+    const RAMP_TAPER = 24;
+    function rampR(x) { const t = clamp((Math.abs(x) - ARENA.GW / 2) / RAMP_TAPER, 0, 1); return ARENA.RV * t * t * (3 - 2 * t); }
     function sdArena(x, y, z) {
-      const RC = ARENA.RC, RV = ARENA.RV;
+      const RC = ARENA.RC, RV = y < hh ? rampR(x) : ARENA.RV;
       const qx = Math.abs(x) - hw + RC, qz = Math.abs(z) - hl + RC;
       const d2 = Math.hypot(Math.max(qx, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qz), 0) - RC;
       const a = d2 + RV, b = Math.abs(y - hh) - (hh - RV);
@@ -313,6 +348,7 @@
     function kickoffSpot(team, index, perTeam) {
       const list = SPOTS[clamp(perTeam, 1, 3)];
       let [x, z] = list[index % list.length];
+      x *= MAP_SCALE; z *= MAP_SCALE;
       if (team === 1) { x = -x; z = -z; }
       return { x, z, yaw: Math.atan2(-x, -z) };
     }
@@ -320,14 +356,14 @@
       return {
         id, team, x: 0, y: CAR.ride, z: 0, vx: 0, vy: 0, vz: 0, qx: 0, qy: 0, qz: 0, qw: 1, wx: 0, wy: 0, wz: 0,
         ground: true, boost: 33, canDodge: false, jumpT: 0, flipT: 0, fdx: 0, fdz: 0,
-        jc: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0,
+        jc: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0, pitchLock: false,
       };
     }
     function placeCar(c, spot) {
       Object.assign(c, {
         x: spot.x, y: CAR.ride, z: spot.z, vx: 0, vy: 0, vz: 0,
         qx: 0, qy: Math.sin(spot.yaw / 2), qz: 0, qw: Math.cos(spot.yaw / 2), wx: 0, wy: 0, wz: 0,
-        ground: true, boost: 33, canDodge: false, jumpT: 0, flipT: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0,
+        ground: true, boost: 33, canDodge: false, jumpT: 0, flipT: 0, boosting: false, dead: 0, stuckT: 0, jhT: 0, pitchLock: false,
       });
     }
     function newBall() { return { x: 0, y: BALL_R, z: 0, vx: 0, vy: 0, vz: 0 }; }
@@ -356,11 +392,15 @@
         c.stuckT = 0; c.canDodge = false;
       } else if (c.canDodge && c.jumpT < K.DODGE_WIN) {
         c.canDodge = false; c.jhT = 0;
-        const mag = Math.hypot(th, st);
-        if (mag > 0.35) {
-          const fx = th / mag, rx = st / mag;
-          let dx = A.f[0] * fx + A.r[0] * rx, dz = A.f[2] * fx + A.r[2] * rx;
-          const dl = Math.hypot(dx, dz) || 1; dx /= dl; dz /= dl;
+        // flips need forward/back input (with left/right too that makes a diagonal flip);
+        // left/right alone is a plain double jump, so the car keeps steering flat
+        if (Math.abs(th) > 0.35) {
+          const mag = Math.hypot(th, st), fx = th / mag, rx = st / mag;
+          // RL dodge impulse: sideways and braking (against your motion) dodges get stronger the faster you go
+          const fwd = c.vx * A.f[0] + c.vy * A.f[1] + c.vz * A.f[2], sr = Math.min(1, Math.abs(fwd) / K.MAX_SPEED);
+          const braking = Math.abs(fwd) < 4 ? fx < 0 : (fx >= 0) !== (fwd > 0);
+          const fs = braking ? (1 + (K.DODGE_BACK_SCALE - 1) * sr) * 16 / 15 : 1, ss = 1 + (K.DODGE_SIDE_SCALE - 1) * sr;
+          const dx = A.f[0] * fx * fs + A.r[0] * rx * ss, dz = A.f[2] * fx * fs + A.r[2] * rx * ss;
           c.vx += dx * K.DODGE_V; c.vz += dz * K.DODGE_V;
           c.vy = Math.max(0, c.vy * 0.3) + 2;
           c.flipT = K.FLIP_T; c.fdx = rx; c.fdz = fx;
@@ -387,12 +427,14 @@
         let vf = dot(v, A.f), vr = dot(v, A.r), vn = dot(v, n);
         if (vn < 0) vf = Math.sign(vf || 1) * Math.sqrt(vf * vf + vn * vn); // follow the curve without losing speed
         if (c.boosting) vf += K.BOOST_ACC * dt;
+        // throttle pulls hardest from standstill and fades out towards top speed (RL: 100% at 0, 10% just below max)
+        const pull = (v, max) => K.ACC * Math.max(0, 1 - 0.9 * v / max);
         if (th > 0.05) {
           if (vf < 0) vf += K.BRAKE * th * dt;
-          else if (vf < K.MAX_DRIVE) vf = Math.min(K.MAX_DRIVE, vf + K.ACC * th * dt);
+          else if (vf < K.MAX_DRIVE) vf = Math.min(K.MAX_DRIVE, vf + pull(vf, K.MAX_DRIVE) * th * dt);
         } else if (th < -0.05) {
           if (vf > 0) vf += K.BRAKE * th * dt;
-          else if (vf > -K.MAX_REV) vf = Math.max(-K.MAX_REV, vf + K.ACC * th * dt);
+          else if (vf > -K.MAX_REV) vf = Math.max(-K.MAX_REV, vf + pull(-vf, K.MAX_REV) * th * dt);
         } else if (!c.boosting) {
           vf -= Math.sign(vf) * Math.min(Math.abs(vf), K.COAST * dt);
         }
@@ -400,8 +442,10 @@
         vf = clamp(vf, -K.MAX_SPEED, K.MAX_SPEED);
         vr *= Math.exp(-(inp.hb ? K.HB_GRIP : K.GRIP) * dt);
         const sp = Math.abs(vf);
-        const rate = st * (3.4 - 1.9 * Math.min(sp / K.MAX_SPEED, 1)) * Math.min(sp / 4, 1) * (inp.hb ? 1.55 : 1);
-        rotWorld(c, n[0], n[1], n[2], -rate * Math.sign(vf) * dt);
+        // the turn rate (kept in wy, the spin around the car's up axis) eases towards the steering target
+        const target = -st * turnRate(sp, inp.hb) * Math.sign(vf);
+        c.wy += (target - c.wy) * (1 - Math.exp(-K.STEER_RESP * dt));
+        rotWorld(c, n[0], n[1], n[2], c.wy * dt);
         A = carAxes(c);
         // gravity: the part along the surface makes you slide down walls; the part into/away from it
         // is cancelled while you "stick" (on the floor, when fast, or when throttling on a wall)
@@ -412,20 +456,41 @@
         c.vx = A.f[0] * vf + A.r[0] * vr + n[0] * vn;
         c.vy = A.f[1] * vf + A.r[1] * vr + n[1] * vn;
         c.vz = A.f[2] * vf + A.r[2] * vr + n[2] * vn;
-        c.wx = c.wy = c.wz = 0;
+        c.wx = c.wz = 0; // keep wy: a turning car keeps turning when it jumps or drives off an edge
+        c.pitchLock = Math.abs(th) > 0.05; // throttle still held on takeoff won't pitch the car
       } else {
         c.jumpT += dt;
+        if (Math.abs(th) <= 0.05) c.pitchLock = false;
         if (c.flipT > 0) {
+          // one full turn over FLIP_T, easing in and out (spin rate follows 6u(1-u), which integrates to 1)
+          const u = 1 - (c.flipT - dt / 2) / K.FLIP_T, rate = (2 * Math.PI / K.FLIP_T) * 6 * u * (1 - u);
           c.flipT = Math.max(0, c.flipT - dt);
-          if (c.flipT > 0) { c.wx = c.fdz * K.FLIP_RATE; c.wy = 0; c.wz = c.fdx * K.FLIP_RATE; }
-          else { c.wx = c.wy = c.wz = 0; } // flip finished: stop spinning
+          c.wx = c.fdz * rate; c.wy = 0; c.wz = c.fdx * rate;
+        } else if (c.stuckT > 0) {
+          // resting on the body: no air control (jump turns it over); friction stops the spin,
+          // above all the spin around the surface normal, while still letting it tip over
+          const A = carAxes(c), n = arenaNormal(c.x, c.y, c.z);
+          const nl = [-dot(n, A.r), dot(n, A.u), dot(n, A.f)];
+          const wn = (c.wx * nl[0] + c.wy * nl[1] + c.wz * nl[2]) * (1 - Math.exp(-K.REST_SPIN * dt));
+          const kr = Math.exp(-K.REST_DAMP * dt);
+          c.wx = (c.wx - nl[0] * wn) * kr; c.wy = (c.wy - nl[1] * wn) * kr; c.wz = (c.wz - nl[2] * wn) * kr;
         } else {
           const rollIn = clamp(roll + (ar ? st : 0), -1, 1), yawIn = ar ? 0 : st;
-          const k = 1 - Math.exp(-K.AIR_RESP * dt), kd = c.stuckT > 0 ? 0 : 1 - Math.exp(-K.AIR_DAMP * dt); // no damping while resting on something
-          // with input: move towards the target spin rate; without: the spin slowly dies out
-          c.wx += Math.abs(th) > 0.05 ? (th * K.AIR_PITCH - c.wx) * k : -c.wx * kd;
-          c.wy += Math.abs(yawIn) > 0.05 ? (-yawIn * K.AIR_YAW - c.wy) * k : -c.wy * kd;
-          c.wz += Math.abs(rollIn) > 0.05 ? (rollIn * K.AIR_ROLL - c.wz) * k : -c.wz * kd;
+          const pitchIn = c.pitchLock ? 0 : th, T = K.AIR_TORQUE, D = K.AIR_DAMPING;
+          // yaw turns around the world vertical (in car-local axes), so steering never spins the car diagonally;
+          // split that part off so pitch/roll handling below doesn't fight it
+          const A = carAxes(c), yl = [-A.r[1], A.u[1], A.f[1]];
+          let wy = c.wx * yl[0] + c.wy * yl[1] + c.wz * yl[2];
+          c.wx -= yl[0] * wy; c.wy -= yl[1] * wy; c.wz -= yl[2] * wy;
+          // RL air control: input applies torque, so the spin builds up and dies down gradually;
+          // pitch/yaw damping fades out while that input is held, roll is always damped
+          wy += (-yawIn * T[1] - D[1] * (1 - Math.abs(yawIn)) * wy) * dt;
+          c.wx += (pitchIn * T[0] - D[0] * (1 - Math.abs(pitchIn)) * c.wx) * dt;
+          c.wy -= D[1] * c.wy * dt;
+          c.wz += (rollIn * T[2] - D[2] * c.wz) * dt;
+          c.wx += yl[0] * wy; c.wy += yl[1] * wy; c.wz += yl[2] * wy;
+          const wl = Math.hypot(c.wx, c.wy, c.wz);
+          if (wl > K.MAX_ANG) { const s = K.MAX_ANG / wl; c.wx *= s; c.wy *= s; c.wz *= s; }
         }
         // holding jump right after a jump makes it higher
         if (c.jhT > 0) {
@@ -452,8 +517,8 @@
 // wheels (contact points below the body) count as contact points too while not driving
     const WHEELS = [];
     for (const sx of [-1, 1]) for (const sz of [-1, 1]) WHEELS.push([sx * (CAR.hx - 0.25), -CAR.ride, sz * (CAR.hz - 0.55), true]);
-// inertia of the body (box), a bit heavier than a plain box so it doesn't spin too wildly
-    const INERTIA = [((2 * CAR.hy) ** 2 + (2 * CAR.hz) ** 2) / 8, ((2 * CAR.hx) ** 2 + (2 * CAR.hz) ** 2) / 8, ((2 * CAR.hx) ** 2 + (2 * CAR.hy) ** 2) / 8];
+// inertia of the body (box), twice a plain box so it feels heavy and impacts don't set it spinning wildly
+    const INERTIA = [((2 * CAR.hy) ** 2 + (2 * CAR.hz) ** 2) / 6, ((2 * CAR.hx) ** 2 + (2 * CAR.hz) ** 2) / 6, ((2 * CAR.hx) ** 2 + (2 * CAR.hy) ** 2) / 6];
 
     const worldOffset = (A, p) => [
       A.r[0] * p[0] + A.u[0] * p[1] + A.f[0] * p[2],
@@ -505,7 +570,10 @@
       for (const w of WHEELS) { const o = worldOffset(A, w); wheel = Math.min(wheel, arenaDist(c.x + o[0], c.y + o[1], c.z + o[2])); }
       const near = was ? d < CAR.ride + 0.6 : wheel < 0.12;
       if (near && up > (was ? 0.35 : 0.7) && vn < (was ? Math.max(0.6, sp * 0.07) : 3)) {
-        if (!was) { c.canDodge = false; c.flipT = 0; c.wx = c.wy = c.wz = 0; c.jhT = 0; }
+        if (!was) { // landing: keep only the spin around the surface, which the steering then takes over
+          const spin = -c.wx * dot(A.r, n) + c.wy * dot(A.u, n) + c.wz * dot(A.f, n);
+          c.canDodge = false; c.flipT = 0; c.wx = c.wz = 0; c.wy = spin; c.jhT = 0;
+        }
         alignUp(c, n, 0.3); // suspension: the wheels settle on the surface (and follow its curve)
         c.x += n[0] * (CAR.ride - d); c.y += n[1] * (CAR.ride - d); c.z += n[2] * (CAR.ride - d);
         if (vn < 0) { c.vx -= n[0] * vn; c.vy -= n[1] * vn; c.vz -= n[2] * vn; }
@@ -583,10 +651,12 @@
     }
 
 // Oriented box (car) vs sphere (ball). Returns true on a hit.
+// farthest the ball's centre can be from the car's centre and still touch the body
+    const CAR_BALL_REACH = BALL_R + Math.hypot(CAR.hx, CAR.hy, CAR.hz);
     function collideCarBall(c, b) {
       if (c.dead > 0) return false;
       const dx = b.x - c.x, dy = b.y - c.y, dz = b.z - c.z;
-      if (dx * dx + dy * dy + dz * dz > 49) return false;
+      if (dx * dx + dy * dy + dz * dz > CAR_BALL_REACH * CAR_BALL_REACH) return false;
       const { f, r, u } = carAxes(c);
       const lx = dx * r[0] + dy * r[1] + dz * r[2];
       const ly = dx * u[0] + dy * u[1] + dz * u[2];
@@ -647,11 +717,11 @@
       return null;
     }
 
-    return { TICK_RATE, DT, SNAP_EVERY, ARENA, BALL_R, CAR, MATCH_SECONDS, K, PADS, clamp, arenaDist, arenaNormal, carAxes, kickoffSpot, newCar, placeCar, newBall, stepCar, stepBall, goalCheck, collideCarBall, collideCars };
+    return { TICK_RATE, DT, SNAP_EVERY, MAP_SCALE, ARENA, BALL_R, CAR, MATCH_SECONDS, K, PADS, clamp, rampR, RAMP_TAPER, arenaDist, arenaNormal, carAxes, kickoffSpot, newCar, placeCar, newBall, stepCar, stepBall, goalCheck, collideCarBall, collideCars };
   })();
   // ================= scene =================
   const { World, TEAM_COLORS } = (() => {
-    const { ARENA, BALL_R, PADS, K, CAR } = P;
+    const { MAP_SCALE, ARENA, BALL_R, PADS, K, CAR, rampR, RAMP_TAPER } = P;
 
     const TEAM_COLORS = [0x2f8cff, 0xff8a1f];
     const A = ARENA, hw = A.W / 2, hl = A.L / 2, RV = A.RV;
@@ -674,7 +744,7 @@
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x1b2a55);
         this.scene.fog = new THREE.Fog(0x1b2a55, 220, 520);
-        this.camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1200);
+        this.camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1200 * MAP_SCALE);
         this.camera.position.set(0, 40, -120);
         this.cars = new Map();
         this.particles = [];
@@ -691,9 +761,9 @@
         const s = this.scene;
         s.add(new THREE.HemisphereLight(0xbfd8ff, 0x1a2a1a, 1.1));
         const sun = new THREE.DirectionalLight(0xffffff, 1.8);
-        sun.position.set(40, 120, 30); sun.castShadow = true;
+        sun.position.set(40 * MAP_SCALE, 120 * MAP_SCALE, 30 * MAP_SCALE); sun.castShadow = true;
         sun.shadow.mapSize.set(2048, 2048);
-        Object.assign(sun.shadow.camera, { left: -150, right: 150, top: 150, bottom: -150, near: 10, far: 350 });
+        Object.assign(sun.shadow.camera, { left: -150 * MAP_SCALE, right: 150 * MAP_SCALE, top: 150 * MAP_SCALE, bottom: -150 * MAP_SCALE, near: 10, far: 350 * MAP_SCALE });
         sun.shadow.bias = -0.0005;
         s.add(sun); this.sun = sun;
 
@@ -708,10 +778,10 @@
           g.strokeStyle = 'rgba(255,255,255,0.85)'; g.lineWidth = 6;
           const sx = w / A.W, sz = h / A.L;
           g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
-          g.beginPath(); g.arc(w / 2, h / 2, 21 * sx, 0, Math.PI * 2); g.stroke();
+          g.beginPath(); g.arc(w / 2, h / 2, 21 * MAP_SCALE * sx, 0, Math.PI * 2); g.stroke();
           g.beginPath(); g.arc(w / 2, h / 2, 1.2 * sx, 0, Math.PI * 2); g.fillStyle = '#fff'; g.fill();
           for (const top of [true, false]) {
-            const bw = (A.GW + 26) * sx, bd = 30 * sz, y = top ? RV * sz : h - bd - RV * sz;
+            const bw = (A.GW + 26) * sx, bd = 30 * MAP_SCALE * sz, y = top ? RV * sz : h - bd - RV * sz;
             g.strokeRect((w - bw) / 2, y, bw, bd);
           }
         });
@@ -740,15 +810,15 @@
         };
         const floor = new THREE.Mesh(flatGeo(roundRect(ia, ib, irc), 0), floorMat);
         floor.receiveShadow = true; s.add(floor);
-        for (const sz of [-1, 1]) { // flat floor strip in front of each goal (the curve is cut away there)
-          const st = new THREE.Shape();
+        for (const sz of [-1, 1]) { // flat floor in front of each goal, under the tapering ramp (which covers it where it rises)
+          const st = new THREE.Shape(), gx = A.GW / 2 + RAMP_TAPER;
           const z0 = sz * ib, z1 = sz * hl;
-          st.moveTo(-A.GW / 2, z0); st.lineTo(A.GW / 2, z0); st.lineTo(A.GW / 2, z1); st.lineTo(-A.GW / 2, z1); st.closePath();
-          const m = new THREE.Mesh(flatGeo(st, 0.001), floorMat); m.receiveShadow = true; s.add(m);
+          st.moveTo(-gx, z0); st.lineTo(gx, z0); st.lineTo(gx, z1); st.lineTo(-gx, z1); st.closePath();
+          const m = new THREE.Mesh(flatGeo(st, -0.02), floorMat); m.receiveShadow = true; s.add(m);
         }
 
         // outside ground
-        const out = new THREE.Mesh(new THREE.PlaneGeometry(900, 900), new THREE.MeshStandardMaterial({ color: 0x222c4a, roughness: 1 }));
+        const out = new THREE.Mesh(new THREE.PlaneGeometry(900 * MAP_SCALE, 900 * MAP_SCALE), new THREE.MeshStandardMaterial({ color: 0x222c4a, roughness: 1 }));
         out.rotation.x = -Math.PI / 2; out.position.y = -0.05; s.add(out);
 
         // ---- curved walls: the inner contour swept along a rounded profile ----
@@ -760,16 +830,29 @@
           for (const t of [...ts].sort((p, q) => p - q)) contour.push([x0 + (x1 - x0) * t, z0 + (z1 - z0) * t, nx, nz]);
         };
         const arc = (cx, cz, a0) => { for (let i = 0; i < 12; i++) { const a = a0 + (i / 12) * Math.PI / 2; contour.push([cx + irc * Math.cos(a), cz + irc * Math.sin(a), Math.cos(a), Math.sin(a)]); } };
-        const gxT = (x0, x1) => [(A.GW / 2 - x0) / (x1 - x0), (-A.GW / 2 - x0) / (x1 - x0)];
+        // extra samples at the goal posts and across the ramp taper beside them
+        const gxT = (x0, x1) => {
+          const ts = [];
+          for (let i = 0; i <= 12; i++) for (const sx of [-1, 1]) ts.push((sx * (A.GW / 2 + RAMP_TAPER * i / 12) - x0) / (x1 - x0));
+          return ts;
+        };
         seg(ia, -ib + irc, ia, ib - irc, 1, 0); arc(ia - irc, ib - irc, 0);
         seg(ia - irc, ib, -ia + irc, ib, 0, 1, gxT(ia - irc, -ia + irc)); arc(-ia + irc, ib - irc, Math.PI / 2);
         seg(-ia, ib - irc, -ia, -ib + irc, -1, 0); arc(-ia + irc, -ib + irc, Math.PI);
         seg(-ia + irc, -ib, ia - irc, -ib, 0, -1, gxT(-ia + irc, ia - irc)); arc(ia - irc, -ib + irc, Math.PI * 1.5);
         const prof = []; // [h, y, isRamp]
         for (let i = 0; i <= 8; i++) { const t = (i / 8) * Math.PI / 2; prof.push([RV * Math.sin(t), RV * (1 - Math.cos(t))]); }
-        for (const y of [A.GH, (A.H) / 2]) prof.push([RV, y]);
+        for (const y of [A.GH, A.H / 2].sort((a, b) => a - b)) prof.push([RV, y]); // wall rows, bottom to top
         for (let i = 8; i >= 0; i--) { const t = (i / 8) * Math.PI / 2; prof.push([RV * Math.sin(t), A.H - RV * (1 - Math.cos(t))]); }
-        const vert = (ci, pj) => { const c = contour[ci % contour.length], p = prof[pj]; return [c[0] + c[2] * p[0], p[1], c[1] + c[3] * p[0]]; };
+        const vert = (ci, pj) => {
+          const c = contour[ci % contour.length];
+          let [h, y] = prof[pj];
+          if (pj <= 8) { // floor curve with the local (tapered) radius
+            const r = rampR(c[0]), t = (pj / 8) * Math.PI / 2;
+            h = RV - r + r * Math.sin(t); y = r * (1 - Math.cos(t));
+          }
+          return [c[0] + c[2] * h, y, c[1] + c[3] * h];
+        };
         const neutralC = new THREE.Color(0x9fb8ff), blueC = new THREE.Color(TEAM_COLORS[0]), orangeC = new THREE.Color(TEAM_COLORS[1]);
         const tint = (z) => { const t = Math.min(1, Math.max(0, (Math.abs(z) - 30) / 50)); return neutralC.clone().lerp(z < 0 ? blueC : orangeC, t); };
         // indexed grids (smooth normals): ramp = bottom curve rows 0..8, wall = rows 8..end
@@ -798,15 +881,6 @@
         const wallGeo = buildGrid(8, prof.length - 1, true);
         s.add(new THREE.Mesh(wallGeo, new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false, emissive: 0x334477, emissiveIntensity: 0.4 })));
         s.add(new THREE.Mesh(wallGeo, new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true, transparent: true, opacity: 0.05, depthWrite: false })));
-        // side faces where the floor curve is cut next to each goal
-        for (const sz of [-1, 1]) for (const sx of [-1, 1]) {
-          const pts = [];
-          for (let i = 0; i <= 8; i++) { const t = (i / 8) * Math.PI / 2; pts.push([sz * (ib + RV * Math.sin(t)), RV * (1 - Math.cos(t))]); }
-          const p = [];
-          for (let i = 0; i < 8; i++) p.push(sx * A.GW / 2, 0, sz * hl, sx * A.GW / 2, pts[i][1], pts[i][0], sx * A.GW / 2, pts[i + 1][1], pts[i + 1][0]);
-          const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3)); g.computeVertexNormals();
-          s.add(new THREE.Mesh(g, rampMesh.material));
-        }
         // ceiling (barely visible)
         s.add(new THREE.Mesh(flatGeo(roundRect(ia, ib, irc), A.H), new THREE.MeshBasicMaterial({ color: 0x9fb8ff, transparent: true, opacity: 0.04, side: THREE.DoubleSide, depthWrite: false })));
         // glowing outlines: where the floor starts to curve, where the wall is vertical, and the top
@@ -1169,7 +1243,7 @@
             const c = p.car;
             if (c.dead > 0) {
               c.dead -= dt;
-              if (c.dead <= 0) { const idx = this.teamList(p.team).indexOf(p); P.placeCar(c, P.kickoffSpot(p.team, idx, this.mode)); c.z += p.team === 0 ? -26 : 26; c.jc = p.input.jc | 0; }
+              if (c.dead <= 0) { const idx = this.teamList(p.team).indexOf(p); P.placeCar(c, P.kickoffSpot(p.team, idx, this.mode)); c.z += (p.team === 0 ? -26 : 26) * P.MAP_SCALE; c.jc = p.input.jc | 0; }
               continue;
             }
             P.stepCar(c, p.input, dt);
@@ -1241,7 +1315,7 @@
           const c = p.car; if (!c || p.team < 0) continue;
           cars.push([p.id, r2(c.x), r2(c.y), r2(c.z), r4(c.qx), r4(c.qy), r4(c.qz), r4(c.qw), r2(c.vx), r2(c.vy), r2(c.vz),
             r2(c.wx), r2(c.wy), r2(c.wz), Math.round(c.boost),
-            (c.ground ? 1 : 0) | (c.boosting ? 2 : 0) | (c.canDodge ? 4 : 0) | (c.dead > 0 ? 8 : 0),
+            (c.ground ? 1 : 0) | (c.boosting ? 2 : 0) | (c.canDodge ? 4 : 0) | (c.dead > 0 ? 8 : 0) | (c.pitchLock ? 16 : 0),
             r3(c.flipT), r3(c.fdx), r3(c.fdz), c.jc, r3(c.jumpT), r3(c.stuckT), r3(c.jhT)]);
         }
         const base = {
@@ -1277,7 +1351,7 @@
       if (ai.plan <= 0 || ai.tx === undefined) {
         ai.plan = L.react;
         let tx, tz;
-        const ballDanger = (b.z - ownZ) * s < 58 && (c.z - b.z) * s > 0; // ball near own goal and we're on the wrong side
+        const ballDanger = (b.z - ownZ) * s < 58 * P.MAP_SCALE && (c.z - b.z) * s > 0; // ball near own goal and we're on the wrong side
         if (closest === p || room.state === 'goal' || ballDanger) {
           let gx = 0 - b.x, gz = goalZ - b.z; const gl = Math.hypot(gx, gz) || 1; gx /= gl; gz /= gl;
           const behind = (c.z - b.z) * s < 2;
@@ -1304,12 +1378,14 @@
       // jump / dodge at the ball
       ai.t = (ai.t || 0) - P.DT;
       const bd = Math.hypot(b.x - c.x, b.z - c.z);
-      if (c.ground && ai.t <= 0 && bd < 11 && b.y > 5.5 && b.y < 14 && Math.abs(ang) < 0.5) {
+      // distances measured from the ball's surface, so they hold for any ball size
+      const R = P.BALL_R;
+      if (c.ground && ai.t <= 0 && bd < R + 6.8 && b.y > R + 1.3 && b.y < R + 9.8 && Math.abs(ang) < 0.5) {
         ai.t = 0.8; if (Math.random() < L.jumpChance) { inp.jc++; ai.dodge = L.dodge ? 0.18 : 0; }
-      } else if (L.dodge && c.ground && ai.t <= 0 && bd < 8.5 && b.y < 6 && Math.abs(ang) < 0.3 && Math.hypot(c.vx, c.vz) > 25) {
+      } else if (L.dodge && c.ground && ai.t <= 0 && bd < R + 4.3 && b.y < R + 1.8 &&Math.abs(ang) < 0.3 && Math.hypot(c.vx, c.vz) > 25) {
         ai.t = 1.0; if (Math.random() < L.jumpChance) { inp.jc++; ai.dodge = 0.08; }
       }
-      if (!c.ground) { inp.th = P.clamp(A.f[1] * 2.5, -1, 1); inp.roll = P.clamp(A.r[1] * 2.5, -1, 1); inp.st = 0; } // level out in the air
+      if (!c.ground) { inp.th = c.pitchLock ? 0 : P.clamp(A.f[1] * 2.5, -1, 1); inp.roll = P.clamp(A.r[1] * 2.5, -1, 1); inp.st = 0; } // level out in the air
       if (ai.dodge > 0) { ai.dodge -= P.DT; if (ai.dodge <= 0 && !c.ground && c.canDodge) { inp.th = 1; inp.st = 0; inp.jc++; } }
       if (!c.ground && c.stuckT > 0.4 && ai.t <= 0) { inp.jc++; ai.t = 0.8; } // turtled: flip back over
       inp.jc &= 255;
@@ -1568,7 +1644,7 @@
     const ql = Math.hypot(a[4], a[5], a[6], a[7]) || 1;
     return { id: a[0], x: a[1], y: a[2], z: a[3], qx: a[4] / ql, qy: a[5] / ql, qz: a[6] / ql, qw: a[7] / ql,
       vx: a[8], vy: a[9], vz: a[10], wx: a[11], wy: a[12], wz: a[13], boost: a[14],
-      ground: !!(a[15] & 1), boosting: !!(a[15] & 2), canDodge: !!(a[15] & 4), dead: a[15] & 8 ? 1 : 0,
+      ground: !!(a[15] & 1), boosting: !!(a[15] & 2), canDodge: !!(a[15] & 4), dead: a[15] & 8 ? 1 : 0, pitchLock: !!(a[15] & 16),
       flipT: a[16], fdx: a[17], fdz: a[18], jc: a[19], jumpT: a[20], stuckT: a[21], jhT: a[22] };
   }
   const predicting = () => lastSnap && (lastSnap.st === 'playing' || lastSnap.st === 'goal');
@@ -1924,7 +2000,7 @@
       updateHud(me, now);
     } else {
       const t = now / 4000;
-      world.camera.position.set(Math.sin(t) * 120, 45, Math.cos(t) * 120); world.camera.lookAt(0, 0, 0);
+      world.camera.position.set(Math.sin(t) * 120 * P.MAP_SCALE, 45 * P.MAP_SCALE, Math.cos(t) * 120 * P.MAP_SCALE); world.camera.lookAt(0, 0, 0);
     }
     world.tickParticles(dt);
     world.render();
